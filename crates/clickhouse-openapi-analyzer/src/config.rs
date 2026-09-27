@@ -41,7 +41,13 @@ fn pairs(values: &[(&str, &str)]) -> BTreeSet<(String, String)> {
 /// Canonical comparison policy for the ClickHouse Cloud API library.
 pub fn clickhouse_cloud_config() -> AnalyzerConfig {
     AnalyzerConfig {
-        non_openapi_client_methods: strings(&["run_query", "run_query_bearer"]),
+        // These query-host routes are implemented by the SQL console service,
+        // independently of the management API's published OpenAPI specification.
+        non_openapi_client_methods: strings(&[
+            "run_query",
+            "run_query_bearer",
+            "run_postgres_query_bearer",
+        ]),
         optionality_exemptions: pairs(OPTIONALITY_EXEMPTIONS),
         fractional_response_exemptions: pairs(FRACTIONAL_RESPONSE_EXEMPTIONS),
         extra_field_exemptions: BTreeSet::new(),
