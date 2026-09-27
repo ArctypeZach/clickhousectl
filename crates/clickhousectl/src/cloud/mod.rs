@@ -58,7 +58,15 @@ fn ignored_env_credentials_notice(
 pub async fn run(args: CloudArgs, json: bool) -> Result<()> {
     // Auth subcommands don't need a client.
     if let CloudCommands::Auth { command } = args.command {
-        return auth::run(command, args.url.as_deref(), args.debug, json).await;
+        return auth::run(
+            command,
+            args.api_key.as_deref(),
+            args.api_secret.as_deref(),
+            args.url.as_deref(),
+            args.debug,
+            json,
+        )
+        .await;
     }
 
     // Refresh OAuth tokens if needed. Errors here are filesystem failures
@@ -119,6 +127,12 @@ fn cloud_error_to_top_level(e: CloudError) -> Error {
         // Auth failures own the exit code (4) and have their own remediation
         // text, so a structured detail never displaces them.
         (CloudErrorKind::Auth, _) => Error::AuthRequired(e.message),
+        // Input-dependent validation keeps clap's usage format and exit 2,
+        // even when the invalid value could only be found after parsing.
+        (CloudErrorKind::Usage, _) => Error::Usage(Box::new(clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            e.message,
+        ))),
         // A structured detail replaces the prose *only* in JSON mode; its
         // `message` is the same text, so human output is unchanged (#644).
         (CloudErrorKind::Generic, Some(details)) => Error::CloudDetailed(details),
@@ -216,6 +230,12 @@ mod runtime_tests {
         let auth = cloud_error_to_top_level(CloudError::auth("nope"));
         assert!(matches!(&auth, Error::AuthRequired(message) if message == "nope"));
         assert_eq!(auth.exit_code(), 4);
+
+        let usage = cloud_error_to_top_level(CloudError::usage("invalid input"));
+        assert!(
+            matches!(&usage, Error::Usage(error) if error.kind() == clap::error::ErrorKind::ValueValidation)
+        );
+        assert_eq!(usage.exit_code(), 2);
 
         let generic = cloud_error_to_top_level(CloudError::new("boom"));
         assert!(

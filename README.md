@@ -691,6 +691,9 @@ Credential resolution order:
 4. Environment variables from `.env`
 5. OAuth tokens.
 
+Supplying only `--api-key` or only `--api-secret` blocks fallback to other sources.
+`cloud auth status` still succeeds with no active authentication; `--debug` identifies the missing flag.
+
 When environment credentials are configured but a credentials file or explicit
 CLI flags take precedence, clickhousectl prints a one-line note to stderr.
 `cloud auth status` also marks the environment credentials as configured but
@@ -1359,7 +1362,7 @@ Human detail output preserves explicit empty values: configuration sections show
 
 Use `clickhousectl cloud postgres create --help` for the complete option list. Save any initial password and connection string in the create response because later `postgres get` responses do not return credentials. If both are omitted, run `clickhousectl cloud postgres reset-password <postgres-id> --generate`.
 
-`postgres get` supplies the service host and username. The documented connection examples use port `5432`, database `postgres`, and TLS. Export the service-specific CA with `certs get --output` and use `sslmode=verify-full`, as recommended for production in the [Managed Postgres connection guide](https://clickhouse.com/docs/products/managed-postgres/connection). The example above omits the password so `psql` can prompt for it when needed. A passwordless URI is also valid: `postgresql://<username>@<host>:5432/postgres?sslmode=verify-full&sslrootcert=ca.pem`. If an application requires a password in that URI, percent-encode the username and password as URI components first; shell quoting does not replace percent-encoding.
+`postgres get` supplies the service host and username. The documented connection examples use port `5432` and database `postgres`. Export the service-specific CA with `certs get --output` and use `sslmode=verify-full`, as recommended for production in the [Managed Postgres connection guide](https://clickhouse.com/docs/products/managed-postgres/connection). The example above omits the password so `psql` can prompt for it when needed. A passwordless URI is also valid: `postgresql://<username>@<host>:5432/postgres?sslmode=verify-full&sslrootcert=ca.pem`. If an application requires a password in that URI, percent-encode the username and password as URI components first; shell quoting does not replace percent-encoding.
 
 Read-replica creation and point-in-time restore return the new service details without a password. Use the returned service ID with `postgres get` and wait for `state=running`. Do not infer that a replica shares its source's current password. For a restore, reset the restored service's password when no valid credential is known; do not assume a historical restore accepts the source's present-day password.
 
@@ -2324,7 +2327,8 @@ for the full connection flow.
 Kinesis create and schema discovery accept `--format Protobuf` with the required
 `--protobuf-schema-file <PATH|->`. Supply raw `.proto` source or a serialized descriptor set;
 the CLI base64-encodes it. Empty schemas and encoded schemas above 1 MiB are rejected.
-The schema flag is rejected for other formats.
+Missing or incompatible schema flags and empty or oversized schemas are usage errors
+(exit 2); file and stdin read failures remain runtime errors (exit 1).
 
 For Kinesis create and schema discovery, omitting `--auth` infers `IAM_USER`
 from a complete `--access-key-id` / `--secret-key` pair; otherwise it uses `IAM_ROLE`.
@@ -2417,13 +2421,14 @@ only supported `--replication-mode` value.
 are repeatable and may be given together. At least one mapping from either
 flag is required.
 
-`--table-mapping schema.table:target_table` is unchanged: it maps one source
-table to one destination table and leaves every other per-table option at the
-ClickPipes default.
+`--table-mapping schema.table:target_table` maps one source table to one
+destination table using `ReplacingMergeTree`. Other per-table options keep
+their defaults.
 
-`--table-mapping-json <JSON>` takes the API's table mapping object verbatim,
-for the options that shape the destination table ClickPipes creates and
-therefore cannot be changed once the pipe exists:
+`--table-mapping-json <JSON>` accepts the API's table mapping fields, including
+an explicit `tableEngine` override. An omitted engine also uses
+`ReplacingMergeTree`. These options shape the destination table ClickPipes
+creates and therefore cannot be changed once the pipe exists:
 
 ```bash
 clickhousectl cloud clickpipe create postgres <service-id> \
@@ -2452,7 +2457,18 @@ clickhousectl cloud clickpipe create postgres <service-id> \
 | `useCustomSortingKey` | Whether the API applies `sortingKeys`. Set to `true` automatically when `sortingKeys` is given. |
 | `partitionByExpr` | `PARTITION BY` expression for the destination table, for example `toYYYYMM(created_at)`. |
 | `partitionKey` | Column used to partition the initial snapshot for parallelism. Unrelated to the destination table's `PARTITION BY`. |
-| `tableEngine` | One of `MergeTree`, `ReplacingMergeTree` or `Null`. Defaults to `MergeTree`, which is what the simple form sends. |
+| `tableEngine` | One of `MergeTree`, `ReplacingMergeTree` or `Null`. Defaults to `ReplacingMergeTree`, as does the simple form. Explicit values are preserved. |
+
+For current-state CDC queries, use `FINAL` and exclude deletion markers:
+
+```sql
+SELECT * FROM public_users FINAL WHERE _peerdb_is_deleted = 0;
+```
+
+The engine alone does not make a raw `SELECT` return deduplicated current
+state. See the [Postgres CDC deduplication guide](https://clickhouse.com/docs/integrations/clickpipes/postgres/deduplication).
+An explicit `MergeTree` override retains row versions and does not support
+`FINAL`; choose it only when you intend to process those events yourself.
 
 Every value is validated before any request is made, and a failure is a usage
 error (exit code 2):
@@ -2549,17 +2565,20 @@ left out of the request:
 
 | Flag | Meaning |
 | --- | --- |
-| `--sync-interval-seconds <SECONDS>` | Interval in seconds to sync data from Postgres during CDC replication. |
-| `--pull-batch-size <ROWS>` | Number of rows to pull in each batch during CDC replication. |
-| `--initial-load-parallelism <WORKERS>` | Number of parallel workers to use per table in the initial snapshot phase. |
-| `--snapshot-rows-per-partition <ROWS>` | Number of rows per partition during the snapshot phase. |
-| `--snapshot-parallel-tables <TABLES>` | Number of tables to snapshot in parallel during the initial load phase. |
+| `--sync-interval-seconds <SECONDS>` | Interval in seconds to sync data from Postgres during CDC replication; at least 1. |
+| `--pull-batch-size <ROWS>` | Number of rows to pull in each batch during CDC replication; at least 1. |
+| `--initial-load-parallelism <WORKERS>` | Number of parallel workers to use per table in the initial snapshot phase; at least 1. |
+| `--snapshot-rows-per-partition <ROWS>` | Number of rows per partition during the snapshot phase; at least 1,000. |
+| `--snapshot-parallel-tables <TABLES>` | Number of tables to snapshot in parallel during the initial load phase; at least 1. |
 | `--allow-nullable-columns <true\|false>` | Preserve Postgres nullability in the destination table, creating columns without `NOT NULL` as `Nullable(...)`. Nullable types carry a performance cost in ClickHouse. |
 | `--enable-failover-slots <true\|false>` | Enable failover support for the replication slot on PG17 and newer. Applies only when ClickPipes creates the slot, so not with `--replication-slot-name`. |
 | `--delete-on-merge <true\|false>` | Enable hard delete behaviour in `ReplacingMergeTree` for PostgreSQL `DELETE` operations. |
 
 `--allow-nullable-columns`, `--enable-failover-slots`, and `--delete-on-merge`
 take an explicit `true` or `false` value and default to `false` when omitted.
+
+Numeric values below these minimums are rejected locally with usage exit `2`,
+before any API request. Omitting a numeric flag leaves its setting omitted.
 
 These are create-time decisions. The Cloud API can patch only
 `syncIntervalSeconds` and `pullBatchSize` after the pipe exists, so the

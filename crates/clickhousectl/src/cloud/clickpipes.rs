@@ -482,7 +482,7 @@ impl ClickPipeCommands {
             ClickPipeCreateCommands::Kinesis(args) => (
                 "kinesis",
                 build_create_request_args(&args.request, ClickPipeSourceKind::Kinesis)
-                    .and_then(|_| resolve_kinesis_auth(&args.source))
+                    .and_then(|_| validate_kinesis_source_args(&args.source))
                     .err(),
             ),
             ClickPipeCreateCommands::Postgres(args) => {
@@ -515,7 +515,7 @@ impl ClickPipeCommands {
         else {
             return None;
         };
-        resolve_kinesis_auth(&args.source)
+        validate_kinesis_source_args(&args.source)
             .err()
             .map(|error| ("kinesis", error.message))
     }
@@ -793,9 +793,9 @@ CONTEXT FOR AGENTS:
   https://clickhouse.com/docs/integrations/clickpipes/postgres
   TLS and certificate verification are on by default; prefer --ca-certificate
   over either security opt-out for a private source CA.
-  Managed Postgres: save its CA with `cloud postgres certs get <pg-id> --output ca.pem`,
-  then pass ca.pem to --ca-certificate.
-  Only --sync-interval-seconds and --pull-batch-size can change after creation.")]
+  Managed Postgres CA: `cloud postgres certs get <pg-id> --output ca.pem`.
+  Only --sync-interval-seconds and --pull-batch-size can change after creation.
+  Current-state queries: SELECT ... FROM target FINAL WHERE _peerdb_is_deleted = 0.")]
     Postgres(PostgresCreateArgs),
 
     /// Create a ClickPipe from MySQL
@@ -1257,7 +1257,7 @@ pub struct KinesisSourceFields {
     /// Protobuf schema file or - for stdin; requires --format Protobuf
     ///
     /// Required for Protobuf; accepts .proto source or a binary descriptor set.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", required_if_eq("format", "Protobuf"))]
     pub protobuf_schema_file: Option<String>,
 
     /// Authentication method (inferred when omitted)
@@ -1379,7 +1379,7 @@ pub struct PostgresCreateArgs {
 
     /// Table mappings as schema.table:target_table (repeatable)
     ///
-    /// Leaves every other per-table option at the ClickPipes default.
+    /// Uses ReplacingMergeTree; override tableEngine with --table-mapping-json.
     #[arg(
         long = "table-mapping",
         value_name = "SCHEMA.TABLE:TARGET_TABLE",
@@ -1389,10 +1389,9 @@ pub struct PostgresCreateArgs {
 
     /// Full table mapping as a JSON object (repeatable)
     ///
-    /// Takes the API's table mapping object verbatim, for the per-table
-    /// options the simple form cannot express: excludedColumns, sortingKeys,
-    /// useCustomSortingKey, partitionByExpr, partitionKey and tableEngine.
-    /// Combinable with --table-mapping; unknown fields are rejected.
+    /// Supports per-table options, including an explicit tableEngine override.
+    /// Omitted tableEngine uses ReplacingMergeTree. Combinable with
+    /// --table-mapping; unknown fields are rejected.
     #[arg(long = "table-mapping-json", value_name = "JSON")]
     pub table_mappings_json: Vec<String>,
 
@@ -1451,24 +1450,24 @@ pub struct PostgresCreateArgs {
     #[arg(long)]
     pub replication_slot_name: Option<String>,
 
-    /// Interval in seconds to sync data from Postgres during CDC replication
-    #[arg(long, value_name = "SECONDS")]
+    /// CDC sync interval in seconds (at least 1)
+    #[arg(long, value_name = "SECONDS", allow_negative_numbers = true, value_parser = clap::value_parser!(i64).range(1..))]
     pub sync_interval_seconds: Option<i64>,
 
-    /// Number of rows to pull in each batch during CDC replication
-    #[arg(long, value_name = "ROWS")]
+    /// Rows to pull per CDC batch (at least 1)
+    #[arg(long, value_name = "ROWS", allow_negative_numbers = true, value_parser = clap::value_parser!(i64).range(1..))]
     pub pull_batch_size: Option<i64>,
 
-    /// Parallel workers per table in the initial snapshot phase (create-time only)
-    #[arg(long, value_name = "WORKERS")]
+    /// Snapshot workers per table (at least 1; create-time only)
+    #[arg(long, value_name = "WORKERS", allow_negative_numbers = true, value_parser = clap::value_parser!(i64).range(1..))]
     pub initial_load_parallelism: Option<i64>,
 
-    /// Number of rows per partition during the snapshot phase (create-time only)
-    #[arg(long, value_name = "ROWS")]
+    /// Snapshot rows per partition (at least 1,000; create-time only)
+    #[arg(long, value_name = "ROWS", allow_negative_numbers = true, value_parser = clap::value_parser!(i64).range(1000..))]
     pub snapshot_rows_per_partition: Option<i64>,
 
-    /// Tables to snapshot in parallel during the initial load phase (create-time only)
-    #[arg(long, value_name = "TABLES")]
+    /// Tables to snapshot in parallel (at least 1; create-time only)
+    #[arg(long, value_name = "TABLES", allow_negative_numbers = true, value_parser = clap::value_parser!(i64).range(1..))]
     pub snapshot_parallel_tables: Option<i64>,
 
     /// Preserve Postgres nullability; defaults to false (create-time only)
@@ -2709,7 +2708,12 @@ fn validate_kafka_source_args(args: &KafkaSourceFields) -> CloudResult<()> {
     Ok(())
 }
 
-fn read_protobuf_schema_file(path: &str) -> CloudResult<String> {
+// Keep I/O failures typed; the source chooses how invalid schema content is
+// reported independently of failures to open or read its input.
+fn read_protobuf_schema_file(
+    path: &str,
+    invalid_input: fn(String) -> CloudError,
+) -> CloudResult<String> {
     let contents = if path == "-" {
         use std::io::Read as _;
         let mut contents = Vec::new();
@@ -2719,7 +2723,7 @@ fn read_protobuf_schema_file(path: &str) -> CloudResult<String> {
         std::fs::read(path)?
     };
     if contents.is_empty() {
-        return Err(CloudError::new(if path == "-" {
+        return Err(invalid_input(if path == "-" {
             "no Protobuf schema received on stdin".to_string()
         } else {
             format!("Protobuf schema file '{path}' was empty")
@@ -2728,7 +2732,7 @@ fn read_protobuf_schema_file(path: &str) -> CloudResult<String> {
 
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, contents);
     if encoded.len() > PROTOBUF_SCHEMA_MAX_ENCODED_LENGTH {
-        return Err(CloudError::new(format!(
+        return Err(invalid_input(format!(
             "Protobuf schema exceeds the encoded size limit of {PROTOBUF_SCHEMA_MAX_ENCODED_LENGTH} bytes"
         )));
     }
@@ -2812,7 +2816,7 @@ fn build_kafka_source_with_exactly_once(
     let protobuf_schema = args
         .protobuf_schema_file
         .as_deref()
-        .map(read_protobuf_schema_file)
+        .map(|path| read_protobuf_schema_file(path, CloudError::new))
         .transpose()?;
 
     Ok(ClickPipePostKafkaSource {
@@ -2843,6 +2847,7 @@ fn build_kafka_source_with_exactly_once(
         }),
         schema_registry,
         protobuf_schema,
+        tombstone_mode: None,
         ca_certificate,
         reverse_private_endpoint_ids: args.reverse_private_endpoint_ids.clone(),
     })
@@ -2883,6 +2888,20 @@ fn resolve_kinesis_auth(args: &KinesisSourceFields) -> CloudResult<&str> {
         .unwrap_or(if has_keys { "IAM_USER" } else { "IAM_ROLE" }))
 }
 
+fn validate_kinesis_source_args(args: &KinesisSourceFields) -> CloudResult<&str> {
+    if args.format == "Protobuf" && args.protobuf_schema_file.is_none() {
+        return Err(CloudError::usage(
+            "--format Protobuf requires --protobuf-schema-file",
+        ));
+    }
+    if args.format != "Protobuf" && args.protobuf_schema_file.is_some() {
+        return Err(CloudError::usage(
+            "--protobuf-schema-file can only be used with --format Protobuf",
+        ));
+    }
+    resolve_kinesis_auth(args)
+}
+
 /// Build a `ClickPipePostKinesisSource` from the CLI args. Shared by the
 /// `clickpipe create kinesis` and `clickpipe schema-discover kinesis <SERVICE_ID>`
 /// handlers.
@@ -2891,17 +2910,7 @@ fn build_kinesis_source(
 ) -> CloudResult<clickhouse_cloud_api::models::ClickPipePostKinesisSource> {
     use clickhouse_cloud_api::models::{ClickPipePostKinesisSource, MskIamUser};
 
-    if args.format == "Protobuf" && args.protobuf_schema_file.is_none() {
-        return Err(CloudError::new(
-            "--format Protobuf requires --protobuf-schema-file",
-        ));
-    }
-    if args.format != "Protobuf" && args.protobuf_schema_file.is_some() {
-        return Err(CloudError::new(
-            "--protobuf-schema-file can only be used with --format Protobuf",
-        ));
-    }
-    let auth = resolve_kinesis_auth(args)?;
+    let auth = validate_kinesis_source_args(args)?;
     let access_key = match (args.access_key_id.as_deref(), args.secret_key.as_deref()) {
         (Some(access_key_id), Some(secret_key)) => Some(MskIamUser {
             access_key_id: access_key_id.to_string(),
@@ -2914,7 +2923,7 @@ fn build_kinesis_source(
         protobuf_schema: args
             .protobuf_schema_file
             .as_deref()
-            .map(read_protobuf_schema_file)
+            .map(|path| read_protobuf_schema_file(path, CloudError::usage))
             .transpose()?,
         format: parse_enum(&args.format)?,
         stream_name: args.stream_name.clone(),
@@ -2922,6 +2931,7 @@ fn build_kinesis_source(
         authentication: parse_enum(auth)?,
         iam_role: args.iam_role.clone(),
         access_key,
+        schema_registry: None,
         use_enhanced_fan_out: if args.enhanced_fan_out {
             Some(true)
         } else {
@@ -4988,7 +4998,7 @@ fn parse_postgres_table_mapping_json(
             ClickPipePostgresPipeTableMappingTableengine::VALUES,
         )
         .map_err(|error| invalid(error.message))?,
-        None => ClickPipePostgresPipeTableMappingTableengine::default(),
+        None => ClickPipePostgresPipeTableMappingTableengine::ReplacingMergeTree,
     };
 
     Ok(ClickPipePostgresPipeTableMapping {
@@ -5077,6 +5087,7 @@ fn validate_postgres_create_args(
             source_schema_name,
             source_table,
             target_table,
+            table_engine: ClickPipePostgresPipeTableMappingTableengine::ReplacingMergeTree,
             ..Default::default()
         });
     }
@@ -6299,7 +6310,7 @@ mod tests {
 
     fn assert_kinesis_value(flag: &str, value: &str) {
         if flag == "--format" {
-            parse_clickpipe(&[
+            let mut args = vec![
                 "create",
                 "kinesis",
                 "svc-1",
@@ -6315,7 +6326,11 @@ mod tests {
                 "db",
                 "--table",
                 "events",
-            ]);
+            ];
+            if value == "Protobuf" {
+                args.extend(["--protobuf-schema-file", "schema.proto"]);
+            }
+            parse_clickpipe(&args);
             return;
         }
         parse_clickpipe(&[
@@ -8631,6 +8646,61 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
         let message = error.to_string();
         assert!(message.contains("--allow-nullable-columns"), "{message}");
+    }
+
+    #[test]
+    fn postgres_numeric_settings_reject_values_below_their_minimums() {
+        for (flag, values) in [
+            ("--sync-interval-seconds", vec!["0", "-1"]),
+            ("--pull-batch-size", vec!["0", "-1"]),
+            ("--initial-load-parallelism", vec!["0", "-1"]),
+            ("--snapshot-rows-per-partition", vec!["0", "-1", "999"]),
+            ("--snapshot-parallel-tables", vec!["0", "-1"]),
+        ] {
+            for value in values {
+                let mut args = postgres_cli_args(Some("public.events:events"));
+                args.extend([flag, value]);
+                let error = clickpipe_parse_error(&args);
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+                assert!(error.to_string().contains(flag), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn postgres_numeric_settings_parse_and_build_valid_minimums() {
+        let mut cli_args = postgres_cli_args(Some("public.events:events"));
+        cli_args.extend([
+            "--sync-interval-seconds",
+            "1",
+            "--pull-batch-size",
+            "1",
+            "--initial-load-parallelism",
+            "1",
+            "--snapshot-rows-per-partition",
+            "1000",
+            "--snapshot-parallel-tables",
+            "1",
+        ]);
+        let ClickPipeCommands::Create {
+            command: ClickPipeCreateCommands::Postgres(args),
+        } = parse_clickpipe(&cli_args)
+        else {
+            panic!("expected postgres create");
+        };
+        assert_eq!(args.sync_interval_seconds, Some(1));
+        assert_eq!(args.pull_batch_size, Some(1));
+        assert_eq!(args.initial_load_parallelism, Some(1));
+        assert_eq!(args.snapshot_rows_per_partition, Some(1000));
+        assert_eq!(args.snapshot_parallel_tables, Some(1));
+
+        let request = build_postgres_request(&args).unwrap();
+        let settings = request.source.postgres.unwrap().settings;
+        assert_eq!(settings.sync_interval_seconds, Some(1));
+        assert_eq!(settings.pull_batch_size, Some(1));
+        assert_eq!(settings.initial_load_parallelism, Some(1));
+        assert_eq!(settings.snapshot_num_rows_per_partition, Some(1000));
+        assert_eq!(settings.snapshot_number_of_parallel_tables, Some(1));
     }
 
     #[test]
@@ -11576,7 +11646,7 @@ mod tests {
                 use_custom_sorting_key: false,
                 partition_by_expr: String::new(),
                 partition_key: String::new(),
-                table_engine: ClickPipePostgresPipeTableMappingTableengine::MergeTree,
+                table_engine: ClickPipePostgresPipeTableMappingTableengine::ReplacingMergeTree,
             }
         );
     }
@@ -11942,6 +12012,7 @@ mod tests {
                 source_schema_name: "public".into(),
                 source_table: "events".into(),
                 target_table: "events".into(),
+                table_engine: ClickPipePostgresPipeTableMappingTableengine::ReplacingMergeTree,
                 ..Default::default()
             }
         );
@@ -13736,7 +13807,39 @@ mod tests {
     }
 
     #[test]
+    fn kinesis_protobuf_schema_is_required_at_parse_time() {
+        for operation in ["create", "schema-discover"] {
+            let mut args = vec![
+                operation,
+                "kinesis",
+                "svc-1",
+                "--stream-name",
+                "stream",
+                "--region",
+                "us-east-1",
+                "--format",
+                "Protobuf",
+            ];
+            if operation == "create" {
+                args.extend([
+                    "--name",
+                    "pipe",
+                    "--database",
+                    "default",
+                    "--table",
+                    "events",
+                ]);
+            }
+            assert_eq!(
+                clickpipe_parse_error(&args).kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+    }
+
+    #[test]
     fn kinesis_protobuf_rejects_missing_incompatible_and_invalid_files() {
+        use crate::cloud::client::CloudErrorKind;
         let mut args = parsed_kinesis_source("create", &[]);
         assert!(
             build_kinesis_source(&args)
@@ -13745,38 +13848,36 @@ mod tests {
                 .is_none()
         );
         args.protobuf_schema_file = Some("/missing/schema.proto".into());
-        assert!(
-            build_kinesis_source(&args)
-                .unwrap_err()
-                .message
-                .contains("only be used")
+        assert_eq!(
+            build_kinesis_source(&args).unwrap_err().kind,
+            CloudErrorKind::Usage
         );
         args.format = "Protobuf".into();
-        assert!(build_kinesis_source(&args).is_err());
+        let error = build_kinesis_source(&args).unwrap_err();
+        assert_eq!(error.kind, CloudErrorKind::Generic);
+        assert_eq!(error.failure.unwrap().kind, crate::failure::FailureKind::Io);
         args.protobuf_schema_file = None;
-        assert!(
-            build_kinesis_source(&args)
-                .unwrap_err()
-                .message
-                .contains("requires --protobuf-schema-file")
+        assert_eq!(
+            build_kinesis_source(&args).unwrap_err().kind,
+            CloudErrorKind::Usage
         );
         let dir = tempfile::tempdir().unwrap();
         let schema = dir.path().join("schema.proto");
         args.protobuf_schema_file = Some(schema.to_string_lossy().into_owned());
-        std::fs::write(&schema, b"").unwrap();
-        assert!(
-            build_kinesis_source(&args)
-                .unwrap_err()
-                .message
-                .contains("empty")
-        );
-        std::fs::write(&schema, vec![0; PROTOBUF_SCHEMA_MAX_ENCODED_LENGTH]).unwrap();
-        assert!(
-            build_kinesis_source(&args)
-                .unwrap_err()
-                .message
-                .contains("size limit")
-        );
+        for contents in [vec![], vec![0; PROTOBUF_SCHEMA_MAX_ENCODED_LENGTH]] {
+            std::fs::write(&schema, contents).unwrap();
+            assert_eq!(
+                build_kinesis_source(&args).unwrap_err().kind,
+                CloudErrorKind::Usage
+            );
+            // The shared reader preserves Kafka's existing error classification.
+            assert_eq!(
+                read_protobuf_schema_file(schema.to_str().unwrap(), CloudError::new)
+                    .unwrap_err()
+                    .kind,
+                CloudErrorKind::Generic
+            );
+        }
     }
 
     fn parsed_kinesis_source(operation: &str, flags: &[&str]) -> KinesisSourceFields {

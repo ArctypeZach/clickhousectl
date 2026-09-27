@@ -121,8 +121,7 @@ CONTEXT FOR AGENTS:
     /// Update a Postgres service's name, size, HA type or tags
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  --new-name also changes the service host name and its certificates: stored connection strings and
-  pinned CAs break, so re-read `cloud postgres get` and `cloud postgres certs get` afterwards.")]
+  --new-name changes the service hostname; re-read `cloud postgres get` and update connection strings.")]
     Update {
         /// Postgres service ID (from `cloud postgres list`)
         #[command(flatten)]
@@ -1179,7 +1178,7 @@ fn render_postgres_connection_guidance(svc: &PostgresService) {
 
     print_line("");
     print_line(format!(
-        "Connection: host={host} port=5432 database=postgres user={username}; TLS required"
+        "Connection: host={host} port=5432 database=postgres user={username}"
     ));
     print_line(format!(
         "Next: clickhousectl cloud postgres get {postgres_id} (wait for state=running and fill any placeholders)"

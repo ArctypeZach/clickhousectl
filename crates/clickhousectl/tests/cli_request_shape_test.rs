@@ -1047,6 +1047,123 @@ fn invoke_api_key_login(project_dir: &Path) -> std::process::Output {
         .expect("failed to spawn clickhousectl")
 }
 
+#[tokio::test]
+async fn api_key_login_rejects_empty_values_before_touching_saved_credentials_or_http() {
+    let mock = MockServer::start().await;
+    for (key, secret, invalid_flag) in [
+        ("", "", "--api-key"),
+        ("", "new-secret", "--api-key"),
+        ("new-key", "", "--api-secret"),
+    ] {
+        for existing_credentials in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let credentials_dir = dir.path().join(".clickhouse");
+            let credentials_path = credentials_dir.join("credentials.json");
+            let original = if existing_credentials {
+                write_project_api_credentials(dir.path(), "saved-key", "saved-secret");
+                Some(std::fs::read(&credentials_path).unwrap())
+            } else {
+                None
+            };
+            let output = Command::new(clickhousectl_binary())
+                .env_clear()
+                .env("DO_NOT_TRACK", "1")
+                .env("HOME", dir.path().join("home"))
+                .current_dir(dir.path())
+                .args([
+                    "cloud",
+                    "auth",
+                    "login",
+                    "--api-key",
+                    key,
+                    "--api-secret",
+                    secret,
+                    "--url",
+                    &mock.uri(),
+                    "--json",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(invalid_flag), "{stderr}");
+            assert!(stderr.contains("Usage:"), "{stderr}");
+            for credential in ["new-key", "new-secret", "saved-key", "saved-secret"] {
+                assert!(!stderr.contains(credential));
+            }
+            if let Some(original) = original {
+                assert_eq!(std::fs::read(&credentials_path).unwrap(), original);
+            } else {
+                assert!(!credentials_dir.exists());
+            }
+        }
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn api_key_login_saves_a_nonempty_pair_and_status_selects_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = invoke_api_key_login(dir.path());
+    assert_success(&output);
+    let saved: Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join(".clickhouse/credentials.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["api_key"], "new-key");
+    assert_eq!(saved["api_secret"], "new-secret");
+    let output = Command::new(clickhousectl_binary())
+        .env_clear()
+        .env("DO_NOT_TRACK", "1")
+        .env("HOME", dir.path().join("home"))
+        .current_dir(dir.path())
+        .args(["cloud", "auth", "status", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let rows: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let saved = rows.iter().find(|row| row["type"] == "API key").unwrap();
+    assert_eq!(saved["status"], "Active");
+    assert_eq!(saved["scope"], "read/write");
+    assert_eq!(saved["active"], "yes");
+}
+
+#[test]
+fn auth_status_never_selects_empty_saved_credentials() {
+    for (key, secret) in [("", ""), ("", "saved-secret"), ("saved-key", "")] {
+        for with_env in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_project_api_credentials(dir.path(), key, secret);
+            let mut command = Command::new(clickhousectl_binary());
+            command
+                .env_clear()
+                .env("DO_NOT_TRACK", "1")
+                .env("HOME", dir.path().join("home"))
+                .current_dir(dir.path())
+                .args(["cloud", "auth", "status", "--json"]);
+            if with_env {
+                command.env("CLICKHOUSE_CLOUD_API_KEY", "env-key");
+                command.env("CLICKHOUSE_CLOUD_API_SECRET", "env-secret");
+            }
+            let output = command.output().unwrap();
+            assert_success(&output);
+            let rows: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+            let saved = rows.iter().find(|row| row["type"] == "API key").unwrap();
+            assert!(saved["status"].as_str().unwrap().starts_with("Incomplete"));
+            assert_eq!(saved["scope"], "-");
+            assert_eq!(saved["active"], "-");
+            let active: Vec<_> = rows.iter().filter(|row| row["active"] == "yes").collect();
+            if with_env {
+                assert_eq!(active.len(), 1);
+                assert_eq!(active[0]["type"], "Env vars");
+            } else {
+                assert!(active.is_empty());
+            }
+        }
+    }
+}
+
 #[test]
 fn api_key_login_preserves_malformed_credentials() {
     let dir = tempfile::tempdir().unwrap();
@@ -2746,6 +2863,236 @@ async fn cloud_command_survives_closed_stderr_with_credential_notice_and_debug()
         received_request_shape(&mock).await,
         vec![("GET".to_string(), "/v1/organizations".to_string())]
     );
+}
+
+#[tokio::test]
+async fn auth_status_explicit_flags_win_without_revealing_credentials_or_contacting_api() {
+    let mock = MockServer::start().await;
+    for configure_other_sources in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        if configure_other_sources {
+            write_project_api_credentials(dir.path(), "file-key", "file-secret");
+            let token_dir = home.join(".clickhouse");
+            std::fs::create_dir(&token_dir).unwrap();
+            write_oauth_tokens(&token_dir, &mock.uri());
+        }
+        for json in [false, true] {
+            let mut command = Command::new(clickhousectl_binary());
+            command
+                .env_clear()
+                .env("DO_NOT_TRACK", "1")
+                .env("HOME", &home)
+                .current_dir(dir.path())
+                .args([
+                    "cloud",
+                    "auth",
+                    "status",
+                    "--api-key",
+                    "flag-key",
+                    "--api-secret",
+                    "flag-secret",
+                    "--url",
+                    &mock.uri(),
+                    "--debug",
+                ]);
+            if configure_other_sources {
+                command.env("CLICKHOUSE_CLOUD_API_KEY", "env-key");
+                command.env("CLICKHOUSE_CLOUD_API_SECRET", "env-secret");
+            }
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert_success(&output);
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            for credential in [
+                "flag-key",
+                "flag-secret",
+                "file-key",
+                "file-secret",
+                "env-key",
+                "env-secret",
+                "test-bearer-token",
+                "unused",
+            ] {
+                assert!(!stdout.contains(credential), "credential exposed on stdout");
+                assert!(!stderr.contains(credential), "credential exposed on stderr");
+            }
+            assert!(stderr.contains("CLI flags"), "{stderr}");
+            // Compare the same source, scope and selection fields in both formats.
+            let rows: Vec<(String, String, String, String)> = if json {
+                serde_json::from_str::<Vec<Value>>(&stdout)
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["type"].as_str().unwrap().to_owned(),
+                            row["status"].as_str().unwrap().to_owned(),
+                            row["scope"].as_str().unwrap().to_owned(),
+                            row["active"].as_str().unwrap().to_owned(),
+                        )
+                    })
+                    .collect()
+            } else {
+                stdout
+                    .lines()
+                    .skip(2)
+                    .map(|line| {
+                        let cells: Vec<_> =
+                            line.trim_matches('|').split('|').map(str::trim).collect();
+                        assert_eq!(cells.len(), 4, "{line}");
+                        (
+                            cells[0].into(),
+                            cells[1].into(),
+                            cells[2].into(),
+                            cells[3].into(),
+                        )
+                    })
+                    .collect()
+            };
+            assert_eq!(rows.len(), 4);
+            assert_eq!(rows.iter().filter(|row| row.3 == "yes").count(), 1);
+            let flags = rows.iter().find(|row| row.0 == "CLI flags").unwrap();
+            assert_eq!(flags.1, "Active");
+            assert_eq!(flags.2, "read/write");
+            assert_eq!(flags.3, "yes");
+            for source in ["API key", "Env vars", "OAuth"] {
+                let row = rows.iter().find(|row| row.0 == source).unwrap();
+                assert_eq!(row.3, "-");
+                if configure_other_sources {
+                    assert!(row.1.starts_with("Configured"), "{row:?}");
+                    assert_eq!(
+                        row.2,
+                        if source == "OAuth" {
+                            "read-only"
+                        } else {
+                            "read/write"
+                        }
+                    );
+                } else {
+                    assert_eq!(row.1, "Not configured");
+                    assert_eq!(row.2, "-");
+                }
+            }
+        }
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn auth_status_incomplete_flags_explain_missing_credential_without_falling_back() {
+    let mock = MockServer::start().await;
+    for configured_source in [None, Some("API key"), Some("Env vars"), Some("OAuth")] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        if configured_source == Some("API key") {
+            write_project_api_credentials(dir.path(), "file-key", "file-secret");
+        }
+        if configured_source == Some("OAuth") {
+            let token_dir = home.join(".clickhouse");
+            std::fs::create_dir(&token_dir).unwrap();
+            write_oauth_tokens(&token_dir, &mock.uri());
+        }
+        for (supplied, missing) in [("--api-key", "--api-secret"), ("--api-secret", "--api-key")] {
+            for json in [false, true] {
+                let mut command = Command::new(clickhousectl_binary());
+                command
+                    .env_clear()
+                    .env("DO_NOT_TRACK", "1")
+                    .env("HOME", &home)
+                    .current_dir(dir.path())
+                    .args([
+                        "cloud",
+                        "auth",
+                        "status",
+                        supplied,
+                        "flag-credential",
+                        "--url",
+                        &mock.uri(),
+                        "--debug",
+                    ]);
+                if configured_source == Some("Env vars") {
+                    command.env("CLICKHOUSE_CLOUD_API_KEY", "env-key");
+                    command.env("CLICKHOUSE_CLOUD_API_SECRET", "env-secret");
+                }
+                if json {
+                    command.arg("--json");
+                }
+                let output = command.output().unwrap();
+                assert_success(&output);
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert_eq!(
+                    stderr,
+                    format!(
+                        "[debug] auth source: none (incomplete CLI flags: missing {missing})\n"
+                    ),
+                    "supplied={supplied}, configured_source={configured_source:?}, json={json}"
+                );
+                for credential in [
+                    "flag-credential",
+                    "file-key",
+                    "file-secret",
+                    "env-key",
+                    "env-secret",
+                    "test-bearer-token",
+                    "unused",
+                ] {
+                    assert!(!stdout.contains(credential), "credential exposed on stdout");
+                    assert!(!stderr.contains(credential), "credential exposed on stderr");
+                }
+                let rows: Vec<Vec<String>> = if json {
+                    serde_json::from_str::<Vec<Value>>(&stdout)
+                        .unwrap()
+                        .iter()
+                        .map(|row| {
+                            ["type", "status", "scope", "active"]
+                                .map(|field| row[field].as_str().unwrap().to_owned())
+                                .to_vec()
+                        })
+                        .collect()
+                } else {
+                    stdout
+                        .lines()
+                        .skip(2)
+                        .map(|line| {
+                            line.trim_matches('|')
+                                .split('|')
+                                .map(|cell| cell.trim().to_owned())
+                                .collect()
+                        })
+                        .collect()
+                };
+                assert_eq!(rows.len(), 4);
+                for row in rows {
+                    assert_eq!(row.len(), 4);
+                    assert_eq!(row[3], "-", "no source should be active: {row:?}");
+                    if row[0] == "CLI flags" {
+                        assert_eq!(row[1], format!("Incomplete (missing {missing})"));
+                        assert_eq!(row[2], "-");
+                    } else if Some(row[0].as_str()) == configured_source {
+                        assert_eq!(row[1], "Configured (inactive)");
+                        assert_eq!(
+                            row[2],
+                            if row[0] == "OAuth" {
+                                "read-only"
+                            } else {
+                                "read/write"
+                            }
+                        );
+                    } else {
+                        assert_eq!(row[1], "Not configured");
+                        assert_eq!(row[2], "-");
+                    }
+                }
+            }
+        }
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
 }
 
 #[test]
@@ -8824,9 +9171,9 @@ async fn postgres_table_mapping_json_reproduces_every_field_in_the_body() {
             "useCustomSortingKey": false,
             "partitionByExpr": "",
             "partitionKey": "",
-            "tableEngine": "MergeTree",
+            "tableEngine": "ReplacingMergeTree",
         }),
-        "the simple form's wire shape must not change",
+        "the simple form uses the CDC engine default",
     );
     assert_eq!(
         mappings[1],
@@ -8843,6 +9190,39 @@ async fn postgres_table_mapping_json_reproduces_every_field_in_the_body() {
             "tableEngine": "ReplacingMergeTree",
         }),
     );
+}
+
+#[tokio::test]
+async fn postgres_table_mapping_engine_defaults_and_explicit_overrides_reach_the_api() {
+    for explicit_engine in [
+        None,
+        Some("MergeTree"),
+        Some("ReplacingMergeTree"),
+        Some("Null"),
+    ] {
+        let mock = start_mock_clickpipes_api().await;
+        let mut args = postgres_args_minimal();
+        let mut mapping = serde_json::json!({
+            "sourceSchemaName": "public",
+            "sourceTable": "users",
+            "targetTable": "users",
+        });
+        if let Some(engine) = explicit_engine {
+            mapping["tableEngine"] = engine.into();
+        }
+        args.extend(["--table-mapping-json".into(), mapping.to_string()]);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let body = invoke_cli_capture_body(&mock, &arg_refs).await;
+        let mappings = body["source"]["postgres"]["tableMappings"]
+            .as_array()
+            .unwrap();
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(mappings[0]["tableEngine"], "ReplacingMergeTree");
+        assert_eq!(
+            mappings[1]["tableEngine"],
+            explicit_engine.unwrap_or("ReplacingMergeTree")
+        );
+    }
 }
 
 #[tokio::test]
@@ -9237,6 +9617,66 @@ async fn postgres_cdc_settings_are_absent_unless_their_flags_are_passed() {
     assert_eq!(settings["allowNullableColumns"], false);
     assert_eq!(settings["deleteOnMerge"], false);
     assert_eq!(settings["enableFailoverSlots"], false);
+}
+
+#[tokio::test]
+async fn postgres_numeric_settings_below_minimums_are_usage_errors_before_http() {
+    let mock = MockServer::start().await;
+    for (flag, values) in [
+        ("--sync-interval-seconds", vec!["0", "-1"]),
+        ("--pull-batch-size", vec!["0", "-1"]),
+        ("--initial-load-parallelism", vec!["0", "-1"]),
+        ("--snapshot-rows-per-partition", vec!["0", "-1", "999"]),
+        ("--snapshot-parallel-tables", vec!["0", "-1"]),
+    ] {
+        for value in values {
+            let mut args = postgres_args_minimal();
+            args.extend([flag.into(), value.into()]);
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let output = invoke_cli_with_cloud_credentials(&mock, &arg_refs);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{flag} {value}: {stderr}");
+            assert!(stderr.contains(flag), "{flag} {value}: {stderr}");
+        }
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn postgres_numeric_settings_minimums_are_sent_exactly() {
+    let mock = start_mock_clickpipes_api().await;
+    let mut args = postgres_args_minimal();
+    args.extend(
+        [
+            "--sync-interval-seconds",
+            "1",
+            "--pull-batch-size",
+            "1",
+            "--initial-load-parallelism",
+            "1",
+            "--snapshot-rows-per-partition",
+            "1000",
+            "--snapshot-parallel-tables",
+            "1",
+        ]
+        .map(String::from),
+    );
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let body = invoke_cli_capture_body(&mock, &arg_refs).await;
+    assert_eq!(
+        body["source"]["postgres"]["settings"],
+        serde_json::json!({
+            "replicationMode": "cdc",
+            "allowNullableColumns": false,
+            "deleteOnMerge": false,
+            "enableFailoverSlots": false,
+            "syncIntervalSeconds": 1,
+            "pullBatchSize": 1,
+            "initialLoadParallelism": 1,
+            "snapshotNumRowsPerPartition": 1000,
+            "snapshotNumberOfParallelTables": 1,
+        })
+    );
 }
 
 #[tokio::test]
@@ -27220,6 +27660,98 @@ async fn service_snapshot_config_patch_preserves_omission_and_pairs() {
             body
         );
     }
+}
+
+fn kinesis_protobuf_args<'a>(
+    operation: &'a str,
+    format: &'a str,
+    schema: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args = kinesis_auth_args(operation, &[]);
+    let format_index = args.iter().position(|arg| *arg == "--format").unwrap() + 1;
+    args[format_index] = format;
+    if let Some(schema) = schema {
+        args.extend(["--protobuf-schema-file", schema]);
+    }
+    args
+}
+
+#[tokio::test]
+async fn kinesis_protobuf_relationships_are_usage_errors_before_auth_files_or_http() {
+    let mock = MockServer::start().await;
+    for operation in ["create", "schema-discover"] {
+        for (format, schema) in [
+            ("Protobuf", None),
+            ("JSONEachRow", Some("/missing/schema.proto")),
+            ("Avro", Some("/missing/schema.proto")),
+            ("AvroConfluent", Some("/missing/schema.proto")),
+        ] {
+            let args = kinesis_protobuf_args(operation, format, schema);
+            for credentials in [false, true] {
+                let output = if credentials {
+                    invoke_cli_with_cloud_credentials(&mock, &args)
+                } else {
+                    invoke_cli_without_cloud_credentials(
+                        &mock,
+                        &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+                    )
+                };
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{operation} {format}: {output:?}"
+                );
+                assert!(output.stdout.is_empty());
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("--protobuf-schema-file"), "{stderr}");
+                assert!(stderr.contains(&format!("{operation} kinesis")), "{stderr}");
+                assert!(serde_json::from_slice::<Value>(&output.stderr).is_err());
+            }
+        }
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn kinesis_protobuf_empty_stdin_is_a_usage_error_and_missing_file_stays_io() {
+    let mock = MockServer::start().await;
+    for operation in ["create", "schema-discover"] {
+        let args = kinesis_protobuf_args(operation, "Protobuf", Some("-"));
+        for json in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let mut command = Command::new(clickhousectl_binary());
+            command
+                .env_clear()
+                .env("DO_NOT_TRACK", "1")
+                .env("HOME", project.path())
+                .env("CLICKHOUSE_CLOUD_API_KEY", "fake-key-for-tests")
+                .env("CLICKHOUSE_CLOUD_API_SECRET", "fake-secret-for-tests")
+                .current_dir(project.path())
+                .args(["cloud", "--url", &mock.uri()])
+                .args(&args)
+                .stdin(Stdio::null());
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(2), "{operation}: {output:?}");
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Protobuf") && stderr.contains("stdin"),
+                "{stderr}"
+            );
+            assert!(serde_json::from_slice::<Value>(&output.stderr).is_err());
+        }
+        let output = invoke_cli_with_cloud_credentials(
+            &mock,
+            &kinesis_protobuf_args(operation, "Protobuf", Some("/missing/schema.proto")),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(cloud_runtime_error(&output)["code"], "io");
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
