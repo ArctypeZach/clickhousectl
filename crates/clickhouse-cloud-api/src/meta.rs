@@ -154,6 +154,7 @@ pub const DEPRECATED_FIELDS: &[(&str, &str)] = &[
     ("ApiKey", "roles"),
     ("ApiKeyPatchRequest", "roles"),
     ("ApiKeyPostRequest", "roles"),
+    ("ByocConfig", "accountName"),
     ("ClickPipeScaling", "concurrency"),
     ("ClickPipeScalingPatchRequest", "concurrency"),
     ("ClickPipeScalingResponse", "concurrency"),
