@@ -200,9 +200,6 @@ pub struct UdfDeployArgs {
     service: String,
     #[command(flatten)]
     dir: UdfDirArg,
-    /// JSON definition overriding NAME/udf.json (file path or - for stdin)
-    #[arg(long = "file", value_name = "PATH", aliases = ["config-file", "config"])]
-    config: Option<String>,
     /// Seconds to wait for each of the build, the wake and the deployment
     #[arg(
         long,
@@ -1028,7 +1025,7 @@ async fn deploy(client: &CloudClient, args: UdfDeployArgs, json: bool) -> CloudR
     let name = args.name.as_str();
     let service = args.service.as_str();
     let source = resolve_source(&args.dir, name)?;
-    let definition = definition_source(args.config.as_deref(), Some(&source))?;
+    let definition = definition_source(None, Some(&source))?;
     check_definition_name(&definition, Some(&source), name)?;
     let create_request = build_udf_create_request(definition.clone(), "pending")?;
     let runtime = create_request_runtime(&create_request)?;
@@ -2007,7 +2004,6 @@ mod tests {
         assert_eq!(args.name, "my_udf");
         assert_eq!(args.service, "svc-1");
         assert_eq!(args.dir.dir, PathBuf::from("clickhouse/udfs"));
-        assert!(args.config.is_none());
         assert_eq!(args.timeout, 1800);
         assert!(!args.no_wake);
 
@@ -2018,8 +2014,6 @@ mod tests {
             "svc-1",
             "--dir",
             "funcs",
-            "--file",
-            "-",
             "--timeout",
             "30",
             "--no-wake",
@@ -2029,7 +2023,6 @@ mod tests {
             panic!("deploy");
         };
         assert_eq!(args.dir.dir, PathBuf::from("funcs"));
-        assert_eq!(args.config.as_deref(), Some("-"));
         assert_eq!(args.timeout, 30);
         assert!(args.no_wake);
 
