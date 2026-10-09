@@ -582,7 +582,7 @@ Field mapping from `udf.json` to the XML (units are identical on both targets):
 | `runtime: native` | `execute_direct` `1` and `command` = `<name>/<arch>/main` for the host CPU (`amd64` or `arm64`); Linux hosts only, other hosts fail with `udf_runtime_unsupported`. Both `main` files are made executable. |
 | `memoryLimitMib`, `sandboxType`, `sandboxVersion` | No local equivalent; accepted and reported as ignored. |
 
-A running server is asked to `SYSTEM RELOAD FUNCTIONS` and `deploy` then confirms the function appears in `system.functions` (`loaded: true` in `--json`). If it does not, `deploy` exits 1 with `udf_not_loaded` and the path of `.clickhouse/servers/<name>/server.log`, where ClickHouse logged why it rejected the definition; the deployed files are kept. A stopped server picks the files up on its next start (`loaded: null`). ClickHouse also rescans the function directory on its own every few seconds, so `reload` is rarely needed outside scripts.
+A running server is asked to `SYSTEM RELOAD FUNCTIONS` and `deploy` then confirms the function appears in `system.functions` (`loaded: true` in `--json`). If it does not, `deploy` exits 1 with `udf_not_loaded` and the path of `.clickhouse/servers/<name>/server.log`, where ClickHouse logged why it rejected the definition; the deployed files are kept. If ClickHouse rejects the reload outright, `deploy` exits 1 with `udf_rejected`: the files are kept, and since ClickHouse reloads every function file together, all reloads on that server fail until you fix and redeploy the function or `local udf remove` it. A stopped server picks the files up on its next start (`loaded: null`). ClickHouse also rescans the function directory on its own every few seconds, so `reload` is rarely needed outside scripts.
 
 For runtime `python3.11`, `requirements.txt` is copied but not installed: install its packages into the interpreter you deploy with (e.g. a virtualenv passed with `--python`). `deploy` lists it under `ignored_files` and prints that reminder in human mode.
 
@@ -3055,11 +3055,12 @@ The schema and meanings of existing codes are stable. New optional fields or cod
 
 | Code | Meaning |
 | ---- | ------- |
-| `server_not_found` | The selected local server does not exist |
+| `server_not_found` | The selected local server does not exist, or `--server` names a local Postgres instance |
 | `udf_definition_invalid` | `udf.json` is not valid JSON (message redacted) or fails validation (message carries the reason) |
 | `udf_source_invalid` | The UDF directory is missing, is itself a symbolic link, has no `udf.json` or entrypoint, or contains a symbolic link |
 | `udf_runtime_unsupported` | Runtime `native` needs a Linux amd64/arm64 host; this host cannot run the binaries |
 | `udf_not_loaded` | The running server did not load the deployed function; see the log path in the message |
+| `udf_rejected` | The running server rejected the deployed function; fix it and redeploy, or remove it |
 | `udf_not_found` | No UDF of that name is deployed to the selected server |
 | `udf_interpreter_not_found` | No `python3.11`/`python3` on `PATH` and no usable `--python` |
 | `udf_query_failed` | The local server rejected a UDF statement; the server's text is redacted, human output shows it |
