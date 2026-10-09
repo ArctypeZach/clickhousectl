@@ -392,7 +392,7 @@ postgres/
 └── seed/                   # Seed data / INSERT statements
 ```
 
-`clickhousectl local udf init <name>` scaffolds `clickhouse/udfs/<name>/` with a `udf.json` definition (the same shape `cloud udf create --file` accepts) and an executable entrypoint: `main.py` for `--runtime python3.11` (the default) or `main` for `--runtime native`. Pass `--type executable_pool` for a pooled function. Re-running keeps existing files and reports only the ones it created.
+`clickhousectl local udf init <name>` scaffolds `clickhouse/udfs/<name>/` with a `udf.json` definition (the same shape `cloud udf create --file` accepts) and its sources: an executable `main.py` for `--runtime python3.11` (the default), or `amd64/` and `arm64/` directories for `--runtime native`, into each of which you build a Linux `main` binary. Pass `--type executable_pool` for a pooled function. Re-running keeps existing files and reports only the ones it created.
 
 ### Running queries
 
