@@ -3268,10 +3268,14 @@ Create a JSON definition and a [source ZIP archive](https://clickhouse.com/docs/
 ```
 
 ```bash
+# Archive clickhouse/udfs/my_udf/ (udf.json plus sources) and create the UDF from it
+clickhousectl cloud udf create my_udf
+# Or upload a ZIP you built yourself, with the definition in a separate file
 clickhousectl cloud udf create --file udf.json --artifact source.zip
 clickhousectl cloud udf get my_udf
-# Wait for status ready, then attach the latest ready version (or --version 2)
-clickhousectl cloud udf attach my_udf <service-id>
+# Poll until status is ready, then attach the latest ready version (or --version 2);
+# --wake wakes an idle service first
+clickhousectl cloud udf attach my_udf <service-id> --wake
 clickhousectl cloud udf attachment list my_udf
 clickhousectl cloud udf attachment get my_udf <service-id>
 clickhousectl cloud udf list --limit 20
@@ -3279,6 +3283,7 @@ clickhousectl cloud udf list --limit 20
 clickhousectl cloud udf list --limit 20 --cursor '<nextCursor>'
 clickhousectl cloud udf version list my_udf
 
+clickhousectl cloud udf version create my_udf
 # version.json contains the complete definition without functionName or uploadId
 clickhousectl cloud udf version create my_udf --file version.json --artifact source-v2.zip
 clickhousectl cloud udf attach my_udf <service-id> --version 2
@@ -3292,7 +3297,11 @@ Required definition fields are `type`, `runtime`, `arguments`, and `returnType`;
 
 Version creation uses defaults for omitted options, without inheriting the previous version's configuration. Supply a complete request definition; GET output includes response-only fields and cannot be used directly as a request. Unknown fields, unsupported enum values, missing required fields and invalid limits fail before upload. Nullable options may be omitted or set to null; both use the API's default behavior.
 
-Creation and version creation each request a new upload URL, stream the ZIP archive, and submit its upload ID once. Failed uploads never submit a create request. Uploads time out after five minutes; rerun the command to obtain a fresh session after any failure. The target service must be running; wake an idle service before attaching. Attachment replaces the service's existing version; omitted `--version` selects the latest ready version. A dependency failure (HTTP 424) exits with an error; inspect the UDF and service before retrying. The latest version and versions still building cannot be deleted individually. A whole UDF cannot be deleted while any version is still building; wait for all versions to finish building first. Deleting a UDF deletes all its versions and detaches it from every service; service removal finishes asynchronously.
+`create NAME` and `version create NAME` archive `clickhouse/udfs/NAME/` themselves (`--dir PATH` selects another parent directory; it is the same directory `local udf deploy` uses, so a function tested locally deploys to Cloud unchanged). `NAME/` must be a real directory, not a symbolic link, and its `udf.json` must name `NAME` (`--file` overrides the definition; `version create` drops `functionName` from the request). The archive is deterministic and excludes `udf.json`, hidden entries and `__pycache__`; symbolic links inside are rejected. Runtime `python3.11` needs `main.py` at the root; runtime `native` ships only `amd64/main` and `arm64/main` (Linux binaries you build, see the [Cloud UDF docs](https://clickhouse.com/docs/products/cloud/features/sql-console-features/user-defined-functions)), and nothing outside those two directories is uploaded. Without `NAME`, `create --file PATH --artifact PATH` uploads a ZIP as is; `version create NAME --artifact PATH` also needs `--file`.
+
+`create`, `version create` and `attach` return as soon as the API accepts them: poll `cloud udf get <name>` until `status` is `ready` (or `error`), and `cloud udf attachment get <name> <service-id>` until it is `deployed`.
+
+Creation and version creation each request a new upload URL, stream the ZIP archive, and submit its upload ID once. Failed uploads never submit a create request. Uploads time out after five minutes; rerun the command to obtain a fresh session after any failure. The target service must be running: `attach --wake` wakes an idle service (HTTP 424 with `SERVICE_IDLE`), waits up to ten minutes for it to reach `running`, attaches once, and returns without waiting for `deployed`; without `--wake` the error names the code, the service state and the `cloud service wake` command. A stopped service must be started first. Attachment replaces the service's existing version; omitted `--version` selects the latest ready version. The latest version and versions still building cannot be deleted individually. A whole UDF cannot be deleted while any version is still building; wait for all versions to finish building first. Deleting a UDF deletes all its versions and detaches it from every service; service removal finishes asynchronously.
 
 All three list commands expose `--cursor` and `--limit` (1–100). JSON output retains the API's pagination object unchanged; human output summarizes the total record count, page limit, and available cursors. Detail and list output tolerate missing fields and new response status values.
 
